@@ -22,6 +22,8 @@ struct stream {
     SDL_atomic_t stopped;
     struct decoder *decoder;
     struct recorder *recorder;
+    AVCodecContext *codec_ctx;
+    AVCodecParserContext *parser;
     struct receiver_state {
         // meta (in order) for frames not consumed yet
         struct frame_meta *frame_meta_queue;

@@ -138,6 +138,21 @@ read_raw_packet(void *opaque, uint8_t *buf, int buf_size) {
     return r;
 }
 
+static bool
+read_packet(struct stream *stream, AVPacket *packet) {
+    ssize_t r = net_recv(stream->socket, buf, buf_size);
+    if (r <= 0) {
+        return false;
+    }
+    return r;
+
+    int remaining
+    int len =
+        av_parser_parse2(stream->parser, stream->codec_ctx,
+                         &packet->data, &packet->size,
+
+}
+
 static void
 notify_stopped(void) {
     SDL_Event stop_event;
@@ -191,9 +206,15 @@ run_stream(void *data) {
         goto end;
     }
 
+    stream->codec_ctx = avcodec_alloc_context3(codec);
+    if (!stream->codec_ctx) {
+        LOGC("Could not allocate codec context");
+        goto end;
+    }
+
     if (stream->decoder && !decoder_open(stream->decoder, codec)) {
         LOGE("Could not open decoder");
-        goto finally_close_input;
+        goto finally_free_codec_ctx;
     }
 
     if (stream->recorder && !recorder_open(stream->recorder, codec)) {
@@ -205,6 +226,9 @@ run_stream(void *data) {
     av_init_packet(&packet);
     packet.data = NULL;
     packet.size = 0;
+
+    stream->parser = av_parser_init(AV_CODEC_ID_H264);
+    assert(stream->parser);
 
     while (!av_read_frame(format_ctx, &packet)) {
         if (SDL_AtomicGet(&stream->stopped)) {
@@ -252,6 +276,8 @@ finally_close_decoder:
     if (stream->decoder) {
         decoder_close(stream->decoder);
     }
+finally_free_decoder_ctx:
+    avcodec_free_context(&stream->codec_ctx);
 finally_close_input:
     avformat_close_input(&format_ctx);
 finally_free_avio_ctx:
