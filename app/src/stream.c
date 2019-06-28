@@ -101,6 +101,8 @@ read_raw_packet(struct stream *stream, const struct frame_header *header,
             parse_packet(stream, &packet->data, &packet->size, buf, r);
         // we should receive a complete AVPacket only if we injected the whole
         // buffer
+        LOGD("%d %d %d", (int)complete, (int)packet_offset, (int)header->len);
+
         SDL_assert(complete == (packet_offset == header->len));
         if (complete) {
             packet->pts = header->pts;
@@ -116,12 +118,26 @@ static bool
 read_packet(struct stream *stream, AVPacket *packet) {
     struct frame_header header;
 
+    // TODO concat first packet
     if (!read_packet_header(stream, &header)) {
         return false;
     }
 
     if (!read_raw_packet(stream, &header, packet)) {
         return false;
+    }
+
+    if (header.len == 27) {
+        if (!read_packet_header(stream, &header)) {
+            return false;
+        }
+
+        header.len += 27;
+
+        if (!read_raw_packet(stream, &header, packet)) {
+            return false;
+        }
+        
     }
 
     return true;
