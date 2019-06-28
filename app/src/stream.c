@@ -138,19 +138,62 @@ read_raw_packet(void *opaque, uint8_t *buf, int buf_size) {
     return r;
 }
 
-static bool
-read_packet(struct stream *stream, AVPacket *packet) {
-    ssize_t r = net_recv(stream->socket, buf, buf_size);
-    if (r <= 0) {
-        return false;
+struct frame_header {
+    uint64_t pts;
+    uint32_t len;
+};
+
+static inline bool
+parse_packet(struct stream *stream, const uint8_t **poutbuf, int *poutbuf_size,
+             const uint8_t *buf, int size) {
+    size_t offset = 0;
+    while (offset < r) {
+        int len = av_parser_parse2(stream->parser, stream->codec_ctx,
+                                   &packet->data, &packet->size,
+                                   &buf[offset], size - offset,
+                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+        SDL_assert(len);
+        offset += len;
+        if (packet->size) {
+            // the whole packet should have been consumed
+            SDL_assert(offset == r);
+            return true;
+        }
     }
-    return r;
+    return false;
+}
 
-    int remaining
-    int len =
-        av_parser_parse2(stream->parser, stream->codec_ctx,
-                         &packet->data, &packet->size,
+static bool
+read_packet(struct stream *stream, const struct frame_header *header,
+            AVPacket *packet) {
+#define PACKET_BUF_SIZE 0x10000
+    // offset of the buffer relative to the whole packet
+    size_t packet_offset = 0;
 
+    while (packet_offset < header->len) {
+        uint8_t buf[PACKET_BUF_SIZE];
+        size_t buf_size = header->len - packet_offset;
+        if (buf_size > PACKET_BUF_SIZE) {
+            buf_size = PACKET_BUF_SIZE;
+        }
+
+        ssize_t r = net_recv(stream->socket, buf, buf_size);
+        if (r <= 0) {
+            return false;
+        }
+        packet_offset += r;
+
+        bool complete =
+            parse_packet(stream, &packet->data, &packet->size, buf, r);
+        // we should receive a complete AVPacket only if we injected the whole
+        // buffer
+        SDL_assert(complete == (packet_offset == header->len));
+        if (complete) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static void
