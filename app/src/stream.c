@@ -18,58 +18,36 @@
 #include "recorder.h"
 
 #define BUFSIZE 0x10000
-
 #define HEADER_SIZE 12
 #define NO_PTS UINT64_C(-1)
 
-static struct frame_meta *
-frame_meta_new(uint64_t pts) {
-    struct frame_meta *meta = SDL_malloc(sizeof(*meta));
-    if (!meta) {
-        return meta;
-    }
-    meta->pts = pts;
-    meta->next = NULL;
-    return meta;
-}
+struct frame_header {
+    uint64_t pts;
+    uint32_t len;
+};
 
-static void
-frame_meta_delete(struct frame_meta *frame_meta) {
-    SDL_free(frame_meta);
+static inline bool
+parse_packet(struct stream *stream, uint8_t **poutbuf, int *poutbuf_size,
+             const uint8_t *buf, int buf_size) {
+    size_t offset = 0;
+    while (offset < buf_size) {
+        int len = av_parser_parse2(stream->parser, stream->codec_ctx,
+                                   poutbuf, poutbuf_size,
+                                   &buf[offset], buf_size - offset,
+                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+        SDL_assert(len);
+        offset += len;
+        if (*poutbuf_size) {
+            // the whole buffer should have been consumed
+            SDL_assert(offset == buf_size);
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool
-receiver_state_push_meta(struct receiver_state *state, uint64_t pts) {
-    struct frame_meta *frame_meta = frame_meta_new(pts);
-    if (!frame_meta) {
-        return false;
-    }
-
-    // append to the list
-    // (iterate to find the last item, in practice the list should be tiny)
-    struct frame_meta **p = &state->frame_meta_queue;
-    while (*p) {
-        p = &(*p)->next;
-    }
-    *p = frame_meta;
-    return true;
-}
-
-static uint64_t
-receiver_state_take_meta(struct receiver_state *state) {
-    struct frame_meta *frame_meta = state->frame_meta_queue; // first item
-    SDL_assert(frame_meta); // must not be empty
-    uint64_t pts = frame_meta->pts;
-    state->frame_meta_queue = frame_meta->next; // remove the item
-    frame_meta_delete(frame_meta);
-    return pts;
-}
-
-static int
-read_packet_with_meta(void *opaque, uint8_t *buf, int buf_size) {
-    struct stream *stream = opaque;
-    struct receiver_state *state = &stream->receiver_state;
-
+read_packet_header(struct stream *stream, struct frame_header *header) {
     // The video stream contains raw packets, without time information. When we
     // record, we retrieve the timestamps separately, from a "meta" header
     // added by the server before each raw packet.
@@ -82,90 +60,21 @@ read_packet_with_meta(void *opaque, uint8_t *buf, int buf_size) {
     //
     // It is followed by <packet_size> bytes containing the packet/frame.
 
-    if (!state->remaining) {
-#define HEADER_SIZE 12
-        uint8_t header[HEADER_SIZE];
-        ssize_t r = net_recv_all(stream->socket, header, HEADER_SIZE);
-        if (r == -1) {
-            return AVERROR(errno);
-        }
-        if (r == 0) {
-            return AVERROR_EOF;
-        }
-        // no partial read (net_recv_all())
-        SDL_assert_release(r == HEADER_SIZE);
-
-        uint64_t pts = buffer_read64be(header);
-        state->remaining = buffer_read32be(&header[8]);
-
-        if (pts != NO_PTS && !receiver_state_push_meta(state, pts)) {
-            LOGE("Could not store PTS for recording");
-            // we could not save the PTS, the recording would be broken
-            return AVERROR(ENOMEM);
-        }
+    uint8_t buf[HEADER_SIZE];
+    ssize_t r = net_recv_all(stream->socket, buf, HEADER_SIZE);
+    if (r < HEADER_SIZE) {
+        LOGE("Unexpected end of stream on frame header");
+        return false;
     }
 
-    SDL_assert(state->remaining);
-
-    if (buf_size > state->remaining) {
-        buf_size = state->remaining;
-    }
-
-    ssize_t r = net_recv(stream->socket, buf, buf_size);
-    if (r == -1) {
-        return errno ? AVERROR(errno) : AVERROR_EOF;
-    }
-    if (r == 0) {
-        return AVERROR_EOF;
-    }
-
-    SDL_assert(state->remaining >= r);
-    state->remaining -= r;
-
-    return r;
-}
-
-static int
-read_raw_packet(void *opaque, uint8_t *buf, int buf_size) {
-    struct stream *stream = opaque;
-    ssize_t r = net_recv(stream->socket, buf, buf_size);
-    if (r == -1) {
-        return errno ? AVERROR(errno) : AVERROR_EOF;
-    }
-    if (r == 0) {
-        return AVERROR_EOF;
-    }
-    return r;
-}
-
-struct frame_header {
-    uint64_t pts;
-    uint32_t len;
-};
-
-static inline bool
-parse_packet(struct stream *stream, const uint8_t **poutbuf, int *poutbuf_size,
-             const uint8_t *buf, int size) {
-    size_t offset = 0;
-    while (offset < r) {
-        int len = av_parser_parse2(stream->parser, stream->codec_ctx,
-                                   &packet->data, &packet->size,
-                                   &buf[offset], size - offset,
-                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
-        SDL_assert(len);
-        offset += len;
-        if (packet->size) {
-            // the whole packet should have been consumed
-            SDL_assert(offset == r);
-            return true;
-        }
-    }
-    return false;
+    header->pts = buffer_read64be(buf);
+    header->len = buffer_read32be(&buf[8]);
+    return true;
 }
 
 static bool
-read_packet(struct stream *stream, const struct frame_header *header,
-            AVPacket *packet) {
+read_raw_packet(struct stream *stream, const struct frame_header *header,
+                AVPacket *packet) {
 #define PACKET_BUF_SIZE 0x10000
     // offset of the buffer relative to the whole packet
     size_t packet_offset = 0;
@@ -179,6 +88,7 @@ read_packet(struct stream *stream, const struct frame_header *header,
 
         ssize_t r = net_recv(stream->socket, buf, buf_size);
         if (r <= 0) {
+            LOGE("Unexpected end of stream");
             return false;
         }
         packet_offset += r;
@@ -189,11 +99,28 @@ read_packet(struct stream *stream, const struct frame_header *header,
         // buffer
         SDL_assert(complete == (packet_offset == header->len));
         if (complete) {
+            packet->pts = header->pts;
+            packet->dts = header->pts;
             return true;
         }
     }
 
     return false;
+}
+
+static bool
+read_packet(struct stream *stream, AVPacket *packet) {
+    struct frame_header header;
+
+    if (!read_packet_header(stream, &header)) {
+        return false;
+    }
+
+    if (!read_raw_packet(stream, &header, packet)) {
+        return false;
+    }
+
+    return true;
 }
 
 static void
@@ -206,42 +133,6 @@ notify_stopped(void) {
 static int
 run_stream(void *data) {
     struct stream *stream = data;
-
-    AVFormatContext *format_ctx = avformat_alloc_context();
-    if (!format_ctx) {
-        LOGC("Could not allocate format context");
-        goto end;
-    }
-
-    unsigned char *buffer = av_malloc(BUFSIZE);
-    if (!buffer) {
-        LOGC("Could not allocate buffer");
-        goto finally_free_format_ctx;
-    }
-
-    // initialize the receiver state
-    stream->receiver_state.frame_meta_queue = NULL;
-    stream->receiver_state.remaining = 0;
-
-    // if recording is enabled, a "header" is sent between raw packets
-    int (*read_packet)(void *, uint8_t *, int) =
-            stream->recorder ? read_packet_with_meta : read_raw_packet;
-    AVIOContext *avio_ctx = avio_alloc_context(buffer, BUFSIZE, 0, stream,
-                                               read_packet, NULL, NULL);
-    if (!avio_ctx) {
-        LOGC("Could not allocate avio context");
-        // avformat_open_input takes ownership of 'buffer'
-        // so only free the buffer before avformat_open_input()
-        av_free(buffer);
-        goto finally_free_format_ctx;
-    }
-
-    format_ctx->pb = avio_ctx;
-
-    if (avformat_open_input(&format_ctx, NULL, NULL, NULL) < 0) {
-        LOGE("Could not open video stream");
-        goto finally_free_avio_ctx;
-    }
 
     AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) {
@@ -271,9 +162,10 @@ run_stream(void *data) {
     packet.size = 0;
 
     stream->parser = av_parser_init(AV_CODEC_ID_H264);
-    assert(stream->parser);
+    stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    SDL_assert(stream->parser);
 
-    while (!av_read_frame(format_ctx, &packet)) {
+    while (!read_packet(stream, &packet)) {
         if (SDL_AtomicGet(&stream->stopped)) {
             // if the stream is stopped, the socket had been shutdown, so the
             // last packet is probably corrupted (but not detected as such by
@@ -287,12 +179,6 @@ run_stream(void *data) {
         }
 
         if (stream->recorder) {
-            // we retrieve the PTS in order they were received, so they will
-            // be assigned to the correct frame
-            uint64_t pts = receiver_state_take_meta(&stream->receiver_state);
-            packet.pts = pts;
-            packet.dts = pts;
-
             // no need to rescale with av_packet_rescale_ts(), the timestamps
             // are in microseconds both in input and output
             if (!recorder_write(stream->recorder, &packet)) {
@@ -303,10 +189,6 @@ run_stream(void *data) {
         }
 
         av_packet_unref(&packet);
-
-        if (avio_ctx->eof_reached) {
-            break;
-        }
     }
 
     LOGD("End of frames");
@@ -319,15 +201,8 @@ finally_close_decoder:
     if (stream->decoder) {
         decoder_close(stream->decoder);
     }
-finally_free_decoder_ctx:
+finally_free_codec_ctx:
     avcodec_free_context(&stream->codec_ctx);
-finally_close_input:
-    avformat_close_input(&format_ctx);
-finally_free_avio_ctx:
-    av_free(avio_ctx->buffer);
-    av_free(avio_ctx);
-finally_free_format_ctx:
-    avformat_free_context(format_ctx);
 end:
     notify_stopped();
     return 0;

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <libavformat/avformat.h>
 #include <SDL2/SDL_atomic.h>
 #include <SDL2/SDL_thread.h>
 
