@@ -79,6 +79,8 @@ read_raw_packet(struct stream *stream, const struct frame_header *header,
     // offset of the buffer relative to the whole packet
     size_t packet_offset = 0;
 
+    LOGD("packet len: %d", (int) header->len);
+
     while (packet_offset < header->len) {
         uint8_t buf[PACKET_BUF_SIZE];
         size_t buf_size = header->len - packet_offset;
@@ -92,6 +94,8 @@ read_raw_packet(struct stream *stream, const struct frame_header *header,
             return false;
         }
         packet_offset += r;
+
+        LOGD("received: %d", (int) r);
 
         bool complete =
             parse_packet(stream, &packet->data, &packet->size, buf, r);
