@@ -21,7 +21,7 @@
 #define HEADER_SIZE 12
 #define NO_PTS UINT64_C(-1)
 
-struct frame_header {
+struct packet_header {
     uint64_t pts;
     uint32_t len;
 };
@@ -47,7 +47,7 @@ parse_packet(struct stream *stream, uint8_t **poutbuf, int *poutbuf_size,
 }
 
 static bool
-read_packet_header(struct stream *stream, struct frame_header *header) {
+read_packet_header(socket_t socket, struct frame_header *header) {
     // The video stream contains raw packets, without time information. When we
     // record, we retrieve the timestamps separately, from a "meta" header
     // added by the server before each raw packet.
@@ -61,7 +61,7 @@ read_packet_header(struct stream *stream, struct frame_header *header) {
     // It is followed by <packet_size> bytes containing the packet/frame.
 
     uint8_t buf[HEADER_SIZE];
-    ssize_t r = net_recv_all(stream->socket, buf, HEADER_SIZE);
+    ssize_t r = net_recv_all(socket, buf, HEADER_SIZE);
     if (r < HEADER_SIZE) {
         LOGE("Unexpected end of stream on frame header");
         return false;
@@ -70,6 +70,17 @@ read_packet_header(struct stream *stream, struct frame_header *header) {
     header->pts = buffer_read64be(buf);
     header->len = buffer_read32be(&buf[8]);
     return true;
+}
+
+static bool
+read_packet(struct stream *stream, AVPacket *packet) {
+    struct receiver_state *state = &stream->receiver_state;
+
+    if (!state->remaining &&
+            !read_packet_header(stream->socket, &state->packet_header)) {
+        LOGE("Could not read packet header");
+        return false;
+    }
 }
 
 static bool
@@ -87,7 +98,7 @@ read_raw_packet(struct stream *stream, const struct frame_header *header,
         if (buf_size > PACKET_BUF_SIZE) {
             buf_size = PACKET_BUF_SIZE;
         }
-
+<
         ssize_t r = net_recv(stream->socket, buf, buf_size);
         if (r <= 0) {
             LOGE("Unexpected end of stream");
@@ -132,7 +143,7 @@ read_packet(struct stream *stream, AVPacket *packet) {
             return false;
         }
 
-        header.len += 27;
+        //header.len += 27;
 
         if (!read_raw_packet(stream, &header, packet)) {
             return false;

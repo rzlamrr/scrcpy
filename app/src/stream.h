@@ -26,9 +26,8 @@ struct stream {
     AVCodecContext *codec_ctx;
     AVCodecParserContext *parser;
     struct receiver_state {
-        // meta (in order) for frames not consumed yet
-        struct frame_meta *frame_meta_queue;
-        size_t remaining; // remaining bytes to receive for the current frame
+        struct packet_header;
+        size_t remaining; // remaining bytes to receive for the current packet
     } receiver_state;
 };
 
