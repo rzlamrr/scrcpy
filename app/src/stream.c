@@ -63,7 +63,7 @@ read_packet_header(socket_t socket, struct frame_header *header) {
     uint8_t buf[HEADER_SIZE];
     ssize_t r = net_recv_all(socket, buf, HEADER_SIZE);
     if (r < HEADER_SIZE) {
-        LOGE("Unexpected end of stream on frame header");
+        LOGE("Unexpected end of stream on packet header");
         return false;
     }
 
@@ -72,16 +72,40 @@ read_packet_header(socket_t socket, struct frame_header *header) {
     return true;
 }
 
-static bool
-read_packet(struct stream *stream, AVPacket *packet) {
+static inline bool
+parse_packet(struct stream *stream, uint8_t **poutbuf, int *poutbuf_size,
+             const uint8_t *buf, int buf_size) {
+    int len = av_parser_parse2(stream->parser, stream->codec_ctx,
+                               poutbuf, poutbuf_size,
+                               &buf[offset], buf_size - offset,
+                               AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+}
+
+// read a (part of) a packet from the stream (consuming packet headers)
+static ssize_t
+read_packet(struct stream *stream, uint8_t buf, size_t len) {
     struct receiver_state *state = &stream->receiver_state;
 
     if (!state->remaining &&
             !read_packet_header(stream->socket, &state->packet_header)) {
         LOGE("Could not read packet header");
-        return false;
+        return -1;
     }
+
+    state->remaining = state->packet_header.len;
+    SDL_assert(state->remaining);
+
+    ssize_t r = net_recv(stream->socket, buf, len);
+    if (r <= 0) {
+        LOGE("Unexpected end of stream");
+        return -1;
+    }
+
+    state->remaining -= r;
 }
+
+static bool
+next_packet(
 
 static bool
 read_raw_packet(struct stream *stream, const struct frame_header *header,
