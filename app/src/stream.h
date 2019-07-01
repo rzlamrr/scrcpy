@@ -26,12 +26,9 @@ struct stream {
     AVCodecContext *codec_ctx;
     AVCodecParserContext *parser;
     struct receiver_state {
-        struct packet_header;
+        struct packet_header packet_header;
         size_t remaining; // remaining bytes to receive on the socket for the current packet
     } receiver_state;
-    struct parser_state {
-        size_t offset;
-    }
 };
 
 void

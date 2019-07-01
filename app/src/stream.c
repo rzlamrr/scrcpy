@@ -81,9 +81,34 @@ parse_packet(struct stream *stream, uint8_t **poutbuf, int *poutbuf_size,
                                AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
 }
 
+static ssize_t
+read_first_packet(struct stream *stream, uint8_t *buf, size_t len) {
+    struct receiver_state *state = &stream->receiver_state;
+
+    if (!read_packet_header(stream->socket, &state->packet_header)) {
+        LOGE("Could not read first packet header");
+        return -1;
+    }
+
+    size_t payload_len = state->packet_header.len;
+    if (payload_len >= BUFSIZE) {
+        // in practice, it should be 20 or 30 bytes
+        LOGE("Header packet too big");
+        return -1;
+    }
+
+    ssize_t r = net_recv_all(stream->socket, buf, payload_len);
+    if (r <= payload_len) {
+        LOGE("Unexpected end of stream during first packet payload");
+        return -1;
+    }
+
+    return payload_len;
+}
+
 // read a (part of) a packet from the stream (consuming packet headers)
 static ssize_t
-read_packet(struct stream *stream, uint8_t buf, size_t len) {
+read_packet(struct stream *stream, uint8_t *buf, size_t len) {
     struct receiver_state *state = &stream->receiver_state;
 
     if (!state->remaining &&
@@ -102,10 +127,53 @@ read_packet(struct stream *stream, uint8_t buf, size_t len) {
     }
 
     state->remaining -= r;
+    return r;
 }
 
 static bool
-next_packet(
+process_packet(struct stream *stream, uint8_t *data, int len) {
+    LOGD("packet!");
+}
+
+static bool
+process_stream(struct stream *stream) {
+    uint8_t buf[BUFSIZE];
+
+    // read the H.264 header
+    ssize_t header_len = read_first_packet(stream, buf, BUFSIZE);
+    if (hr == -1) {
+        return false;
+    }
+
+    if (stream->recorder) {
+        recorder_write_header(stream->recorder, buf, header_len);
+    }
+
+    // the header must be merged with the following packet (the first frame)
+    // for decoding
+
+    ssize_t r = read_packet(stream, &buf[header_len], BUFSIZE - header_len);
+    if (r == -1) {
+        return false;
+    }
+
+    uint8_t *in_data = buf;
+    int in_len = header_len + r;
+    uint8_t out_data;
+    int out_size;
+    while (in_len) {
+        int len = av_parser_parse2(stream->parser, stream->codec_ctx,
+                                   &out_data, &out_size, in_data, in_len,
+                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+        in_data += len;
+        in_len -= len;
+
+        if (packet.size) {
+            process_packet(stream, out_data, out_size);
+        }
+    }
+
+}
 
 static bool
 read_raw_packet(struct stream *stream, const struct frame_header *header,
