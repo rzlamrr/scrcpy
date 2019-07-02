@@ -181,6 +181,9 @@ process_stream(struct stream *stream) {
             LOGD("out_size = %d", (int) out_size);
 
             if (out_size) {
+                if (out_data != in_data) {
+                    LOGD("%p %p ===============================", out_data, in_data);
+                }
                 LOGD("has packet");
                 AVPacket packet;
                 av_init_packet(&packet);
