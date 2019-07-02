@@ -161,7 +161,7 @@ process_stream(struct stream *stream) {
         uint8_t *out_data = NULL;
         int out_size = 0;
         while (in_len) {
-            LOGD("in_len = %d", (int) in_len);
+            LOGD("in_len before = %d", (int) in_len);
                 LOGD("packet parsing: %ld", timestamp_ms());
             int len = av_parser_parse2(stream->parser, stream->codec_ctx,
                                        &out_data, &out_size, in_data, in_len,
@@ -170,6 +170,7 @@ process_stream(struct stream *stream) {
             in_data += len;
             in_len -= len;
             LOGD("in_len = %d", (int) in_len);
+            LOGD("out_size = %d", (int) out_size);
 
             if (out_size) {
                 LOGD("has packet");
@@ -193,7 +194,7 @@ process_stream(struct stream *stream) {
             }
         }
 
-        r = read_packet(stream, &buf[header_len], BUFSIZE - header_len);
+        r = read_packet(stream, buf, BUFSIZE);
         if (r == -1) {
             return;
         }
@@ -235,7 +236,7 @@ run_stream(void *data) {
 
     stream->parser = av_parser_init(AV_CODEC_ID_H264);
     stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
-    //parser->flags |= PARSER_FLAG_USE_CODEC_TS;
+    stream->parser->flags |= PARSER_FLAG_USE_CODEC_TS;
 
     process_stream(stream);
 
