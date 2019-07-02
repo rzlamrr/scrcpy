@@ -21,33 +21,8 @@
 #define HEADER_SIZE 12
 #define NO_PTS UINT64_C(-1)
 
-struct packet_header {
-    uint64_t pts;
-    uint32_t len;
-};
-
-static inline bool
-parse_packet(struct stream *stream, uint8_t **poutbuf, int *poutbuf_size,
-             const uint8_t *buf, int buf_size) {
-    size_t offset = 0;
-    while (offset < buf_size) {
-        int len = av_parser_parse2(stream->parser, stream->codec_ctx,
-                                   poutbuf, poutbuf_size,
-                                   &buf[offset], buf_size - offset,
-                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
-        SDL_assert(len);
-        offset += len;
-        if (*poutbuf_size) {
-            // the whole buffer should have been consumed
-            SDL_assert(offset == buf_size);
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool
-read_packet_header(socket_t socket, struct frame_header *header) {
+read_packet_header(socket_t socket, struct packet_header *header) {
     // The video stream contains raw packets, without time information. When we
     // record, we retrieve the timestamps separately, from a "meta" header
     // added by the server before each raw packet.
@@ -67,18 +42,15 @@ read_packet_header(socket_t socket, struct frame_header *header) {
         return false;
     }
 
+    for (int i = 0; i < r; ++i) {
+        printf("%02x ", buf[i]);
+    }
+    printf("\n");
+
+
     header->pts = buffer_read64be(buf);
     header->len = buffer_read32be(&buf[8]);
     return true;
-}
-
-static inline bool
-parse_packet(struct stream *stream, uint8_t **poutbuf, int *poutbuf_size,
-             const uint8_t *buf, int buf_size) {
-    int len = av_parser_parse2(stream->parser, stream->codec_ctx,
-                               poutbuf, poutbuf_size,
-                               &buf[offset], buf_size - offset,
-                               AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
 }
 
 static ssize_t
@@ -91,6 +63,7 @@ read_first_packet(struct stream *stream, uint8_t *buf, size_t len) {
     }
 
     size_t payload_len = state->packet_header.len;
+    LOGD("payload_len = %x", (int)payload_len);
     if (payload_len >= BUFSIZE) {
         // in practice, it should be 20 or 30 bytes
         LOGE("Header packet too big");
@@ -98,7 +71,7 @@ read_first_packet(struct stream *stream, uint8_t *buf, size_t len) {
     }
 
     ssize_t r = net_recv_all(stream->socket, buf, payload_len);
-    if (r <= payload_len) {
+    if (r < payload_len) {
         LOGE("Unexpected end of stream during first packet payload");
         return -1;
     }
@@ -131,22 +104,37 @@ read_packet(struct stream *stream, uint8_t *buf, size_t len) {
 }
 
 static bool
-process_packet(struct stream *stream, uint8_t *data, int len) {
-    LOGD("packet!");
+process_packet(struct stream *stream, AVPacket *packet) {
+    if (SDL_AtomicGet(&stream->stopped)) {
+        // if the stream is stopped, the socket had been shutdown, so the
+        // last packet is probably corrupted (but not detected as such by
+        // FFmpeg) and will not be decoded correctly
+        return false;
+    }
+
+    if (stream->decoder && !decoder_push(stream->decoder, packet)) {
+        return false;
+    }
+
+    if (stream->recorder && !recorder_write(stream->recorder, packet)) {
+        return false;
+    }
+
+    return true;
 }
 
-static bool
+static void
 process_stream(struct stream *stream) {
     uint8_t buf[BUFSIZE];
 
     // read the H.264 header
     ssize_t header_len = read_first_packet(stream, buf, BUFSIZE);
-    if (hr == -1) {
-        return false;
+    if (header_len == -1) {
+        return;
     }
 
     if (stream->recorder) {
-        recorder_write_header(stream->recorder, buf, header_len);
+        //recorder_write_header(stream->recorder, buf, header_len);
     }
 
     // the header must be merged with the following packet (the first frame)
@@ -154,96 +142,42 @@ process_stream(struct stream *stream) {
 
     ssize_t r = read_packet(stream, &buf[header_len], BUFSIZE - header_len);
     if (r == -1) {
-        return false;
+        return;
     }
 
-    uint8_t *in_data = buf;
-    int in_len = header_len + r;
-    uint8_t out_data;
-    int out_size;
-    while (in_len) {
-        int len = av_parser_parse2(stream->parser, stream->codec_ctx,
-                                   &out_data, &out_size, in_data, in_len,
-                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
-        in_data += len;
-        in_len -= len;
+    LOGD("r = %d", (int)r);
 
-        if (packet.size) {
-            process_packet(stream, out_data, out_size);
+    for (;;) {
+        uint8_t *in_data = buf;
+        int in_len = header_len + r;
+        uint8_t *out_data = NULL;
+        int out_size = 0;
+        while (in_len) {
+            int len = av_parser_parse2(stream->parser, stream->codec_ctx,
+                                       &out_data, &out_size, in_data, in_len,
+                                       AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+            in_data += len;
+            in_len -= len;
+
+            if (out_size) {
+                AVPacket packet;
+                av_init_packet(&packet);
+                packet.data = out_data;
+                packet.size = out_size;
+
+                if (stream->parser->key_frame) {
+                    packet.flags |= AV_PKT_FLAG_KEY;
+                }
+
+                bool ok = process_packet(stream, &packet);
+                av_packet_unref(&packet);
+
+                if (!ok) {
+                    return;
+                }
+            }
         }
     }
-
-}
-
-static bool
-read_raw_packet(struct stream *stream, const struct frame_header *header,
-                AVPacket *packet) {
-#define PACKET_BUF_SIZE 0x10000
-    // offset of the buffer relative to the whole packet
-    size_t packet_offset = 0;
-
-    LOGD("packet len: %d", (int) header->len);
-
-    while (packet_offset < header->len) {
-        uint8_t buf[PACKET_BUF_SIZE];
-        size_t buf_size = header->len - packet_offset;
-        if (buf_size > PACKET_BUF_SIZE) {
-            buf_size = PACKET_BUF_SIZE;
-        }
-<
-        ssize_t r = net_recv(stream->socket, buf, buf_size);
-        if (r <= 0) {
-            LOGE("Unexpected end of stream");
-            return false;
-        }
-        packet_offset += r;
-
-        LOGD("received: %d", (int) r);
-
-        bool complete =
-            parse_packet(stream, &packet->data, &packet->size, buf, r);
-        // we should receive a complete AVPacket only if we injected the whole
-        // buffer
-        LOGD("%d %d %d", (int)complete, (int)packet_offset, (int)header->len);
-
-        SDL_assert(complete == (packet_offset == header->len));
-        if (complete) {
-            packet->pts = header->pts;
-            packet->dts = header->pts;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool
-read_packet(struct stream *stream, AVPacket *packet) {
-    struct frame_header header;
-
-    // TODO concat first packet
-    if (!read_packet_header(stream, &header)) {
-        return false;
-    }
-
-    if (!read_raw_packet(stream, &header, packet)) {
-        return false;
-    }
-
-    if (header.len == 27) {
-        if (!read_packet_header(stream, &header)) {
-            return false;
-        }
-
-        //header.len += 27;
-
-        if (!read_raw_packet(stream, &header, packet)) {
-            return false;
-        }
-        
-    }
-
-    return true;
 }
 
 static void
@@ -279,40 +213,11 @@ run_stream(void *data) {
         goto finally_close_decoder;
     }
 
-    AVPacket packet;
-    av_init_packet(&packet);
-    packet.data = NULL;
-    packet.size = 0;
-
     stream->parser = av_parser_init(AV_CODEC_ID_H264);
-    stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
-    SDL_assert(stream->parser);
+    //stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    //parser->flags |= PARSER_FLAG_USE_CODEC_TS;
 
-    while (!read_packet(stream, &packet)) {
-        if (SDL_AtomicGet(&stream->stopped)) {
-            // if the stream is stopped, the socket had been shutdown, so the
-            // last packet is probably corrupted (but not detected as such by
-            // FFmpeg) and will not be decoded correctly
-            av_packet_unref(&packet);
-            goto quit;
-        }
-        if (stream->decoder && !decoder_push(stream->decoder, &packet)) {
-            av_packet_unref(&packet);
-            goto quit;
-        }
-
-        if (stream->recorder) {
-            // no need to rescale with av_packet_rescale_ts(), the timestamps
-            // are in microseconds both in input and output
-            if (!recorder_write(stream->recorder, &packet)) {
-                LOGE("Could not write frame to output file");
-                av_packet_unref(&packet);
-                goto quit;
-            }
-        }
-
-        av_packet_unref(&packet);
-    }
+    process_stream(stream);
 
     LOGD("End of frames");
 
@@ -338,6 +243,11 @@ stream_init(struct stream *stream, socket_t socket,
     stream->decoder = decoder,
     stream->recorder = recorder;
     SDL_AtomicSet(&stream->stopped, 0);
+    stream->codec_ctx = NULL;
+    stream->parser = NULL;
+    stream->receiver_state.packet_header.pts = 0;
+    stream->receiver_state.packet_header.len = 0;
+    stream->receiver_state.remaining = 0;
 }
 
 bool

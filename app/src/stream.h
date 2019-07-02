@@ -11,9 +11,9 @@
 
 struct video_buffer;
 
-struct frame_meta {
+struct packet_header {
     uint64_t pts;
-    struct frame_meta *next;
+    uint32_t len;
 };
 
 struct stream {
