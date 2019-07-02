@@ -240,8 +240,8 @@ run_stream(void *data) {
     }
 
     stream->parser = av_parser_init(AV_CODEC_ID_H264);
-    stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
-    stream->parser->flags |= PARSER_FLAG_USE_CODEC_TS;
+    //stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    //stream->parser->flags |= PARSER_FLAG_USE_CODEC_TS;
 
     process_stream(stream);
 
