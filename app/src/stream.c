@@ -141,6 +141,8 @@ process_stream(struct stream *stream) {
         return;
     }
 
+    size_t offset = header_len;
+
     if (stream->recorder) {
         //recorder_write_header(stream->recorder, buf, header_len);
     }
@@ -148,16 +150,22 @@ process_stream(struct stream *stream) {
     // the header must be merged with the following packet (the first frame)
     // for decoding
 
-    ssize_t r = read_packet(stream, &buf[header_len], BUFSIZE - header_len);
-    if (r == -1) {
-        return;
-    }
+    //ssize_t r = read_packet(stream, &buf[header_len], BUFSIZE - header_len);
+    //if (r == -1) {
+    //    return;
+    //}
 
-    LOGD("r = %d", (int)r);
 
     for (;;) {
+        ssize_t r = read_packet(stream, buf + offset, BUFSIZE - offset);
+        if (r == -1) {
+            return;
+        }
+
+        offset += r;
+
         uint8_t *in_data = buf;
-        int in_len = header_len + r;
+        int in_len = offset;
         uint8_t *out_data = NULL;
         int out_size = 0;
         while (in_len) {
@@ -193,11 +201,8 @@ process_stream(struct stream *stream) {
                 LOGD("packet decoded: %ld", timestamp_ms());
             }
         }
+        offset = 0;
 
-        r = read_packet(stream, buf, BUFSIZE);
-        if (r == -1) {
-            return;
-        }
     }
 }
 
