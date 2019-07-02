@@ -17,7 +17,7 @@
 #include "log.h"
 #include "recorder.h"
 
-#define BUFSIZE 0x10000
+#define BUFSIZE 0x1000000
 #define HEADER_SIZE 12
 #define NO_PTS UINT64_C(-1)
 
@@ -84,6 +84,8 @@ static ssize_t
 read_packet(struct stream *stream, uint8_t *buf, size_t len) {
     struct receiver_state *state = &stream->receiver_state;
 
+    LOGD("===");
+
     if (!state->remaining &&
             !read_packet_header(stream->socket, &state->packet_header)) {
         LOGE("Could not read packet header");
@@ -93,13 +95,15 @@ read_packet(struct stream *stream, uint8_t *buf, size_t len) {
     state->remaining = state->packet_header.len;
     SDL_assert(state->remaining);
 
-    ssize_t r = net_recv(stream->socket, buf, len);
+    LOGD("net_recv_all = %d", (int) state->remaining);
+    ssize_t r = net_recv_all(stream->socket, buf, state->remaining);
     if (r <= 0) {
         LOGE("Unexpected end of stream");
         return -1;
     }
 
     state->remaining -= r;
+    LOGD("remaining = %d", (int) state->remaining);
     return r;
 }
 
@@ -153,11 +157,14 @@ process_stream(struct stream *stream) {
         uint8_t *out_data = NULL;
         int out_size = 0;
         while (in_len) {
+            LOGD("in_len = %d", (int) in_len);
             int len = av_parser_parse2(stream->parser, stream->codec_ctx,
                                        &out_data, &out_size, in_data, in_len,
                                        AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+            LOGD("len = %d", (int) len);
             in_data += len;
             in_len -= len;
+            LOGD("in_len = %d", (int) in_len);
 
             if (out_size) {
                 AVPacket packet;
@@ -176,6 +183,11 @@ process_stream(struct stream *stream) {
                     return;
                 }
             }
+        }
+
+        r = read_packet(stream, &buf[header_len], BUFSIZE - header_len);
+        if (r == -1) {
+            return;
         }
     }
 }
@@ -214,7 +226,7 @@ run_stream(void *data) {
     }
 
     stream->parser = av_parser_init(AV_CODEC_ID_H264);
-    //stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
     //parser->flags |= PARSER_FLAG_USE_CODEC_TS;
 
     process_stream(stream);
