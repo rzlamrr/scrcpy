@@ -17,10 +17,11 @@
 #include "log.h"
 #include "recorder.h"
 
-#define BUFSIZE 0x1000000
+#define BUFSIZE 0x200000
 #define HEADER_SIZE 12
 #define NO_PTS UINT64_C(-1)
 
+#include "/home/rom/util/time.h"
 static bool
 read_packet_header(socket_t socket, struct packet_header *header) {
     // The video stream contains raw packets, without time information. When we
@@ -50,6 +51,7 @@ read_packet_header(socket_t socket, struct packet_header *header) {
 
     header->pts = buffer_read64be(buf);
     header->len = buffer_read32be(&buf[8]);
+    LOGD("packet header read: %ld", timestamp_ms());
     return true;
 }
 
@@ -96,12 +98,14 @@ read_packet(struct stream *stream, uint8_t *buf, size_t len) {
     SDL_assert(state->remaining);
 
     LOGD("net_recv_all = %d", (int) state->remaining);
+    LOGD("packet receiving: %ld", timestamp_ms());
     ssize_t r = net_recv_all(stream->socket, buf, state->remaining);
     if (r <= 0) {
         LOGE("Unexpected end of stream");
         return -1;
     }
 
+    LOGD("packet received: %ld", timestamp_ms());
     state->remaining -= r;
     LOGD("remaining = %d", (int) state->remaining);
     return r;
@@ -158,6 +162,7 @@ process_stream(struct stream *stream) {
         int out_size = 0;
         while (in_len) {
             LOGD("in_len = %d", (int) in_len);
+                LOGD("packet parsing: %ld", timestamp_ms());
             int len = av_parser_parse2(stream->parser, stream->codec_ctx,
                                        &out_data, &out_size, in_data, in_len,
                                        AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
@@ -167,6 +172,7 @@ process_stream(struct stream *stream) {
             LOGD("in_len = %d", (int) in_len);
 
             if (out_size) {
+                LOGD("has packet");
                 AVPacket packet;
                 av_init_packet(&packet);
                 packet.data = out_data;
@@ -176,12 +182,14 @@ process_stream(struct stream *stream) {
                     packet.flags |= AV_PKT_FLAG_KEY;
                 }
 
+                LOGD("packet decoding: %ld", timestamp_ms());
                 bool ok = process_packet(stream, &packet);
                 av_packet_unref(&packet);
 
                 if (!ok) {
                     return;
                 }
+                LOGD("packet decoded: %ld", timestamp_ms());
             }
         }
 

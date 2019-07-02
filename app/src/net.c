@@ -88,6 +88,15 @@ net_recv(socket_t socket, void *buf, size_t len) {
 
 ssize_t
 net_recv_all(socket_t socket, void *buf, size_t len) {
+//    size_t offset = 0;
+//    while (offset < len) {
+//        ssize_t r = recv(socket, buf + offset, len - offset, 0);
+//        if (r <= 0) {
+//            return offset;
+//        }
+//        offset += r;
+//    }
+//    return len;
     return recv(socket, buf, len, MSG_WAITALL);
 }
 

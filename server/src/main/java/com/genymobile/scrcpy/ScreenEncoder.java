@@ -7,6 +7,7 @@ import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.view.Surface;
 
 import java.io.FileDescriptor;
@@ -102,7 +103,9 @@ public class ScreenEncoder implements Device.RotationListener {
                         writeFrameMeta(fd, bufferInfo, codecBuffer.remaining());
                     }
 
+                    Ln.d("BEGIN writing " + codecBuffer.remaining() + " at " + SystemClock.uptimeMillis());
                     IO.writeFully(fd, codecBuffer);
+                    Ln.d("END writing " + codecBuffer.remaining() + " at " + SystemClock.uptimeMillis());
                 }
             } finally {
                 if (outputBufferId >= 0) {
