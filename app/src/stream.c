@@ -22,52 +22,8 @@
 #define HEADER_SIZE 12
 #define NO_PTS UINT64_C(-1)
 
-static struct frame_meta *
-frame_meta_new(uint64_t pts) {
-    struct frame_meta *meta = SDL_malloc(sizeof(*meta));
-    if (!meta) {
-        return meta;
-    }
-    meta->pts = pts;
-    meta->next = NULL;
-    return meta;
-}
-
-static void
-frame_meta_delete(struct frame_meta *frame_meta) {
-    SDL_free(frame_meta);
-}
-
 static bool
-receiver_state_push_meta(struct receiver_state *state, uint64_t pts) {
-    struct frame_meta *frame_meta = frame_meta_new(pts);
-    if (!frame_meta) {
-        return false;
-    }
-
-    // append to the list
-    // (iterate to find the last item, in practice the list should be tiny)
-    struct frame_meta **p = &state->frame_meta_queue;
-    while (*p) {
-        p = &(*p)->next;
-    }
-    *p = frame_meta;
-    return true;
-}
-
-static uint64_t
-receiver_state_take_meta(struct receiver_state *state) {
-    struct frame_meta *frame_meta = state->frame_meta_queue; // first item
-    SDL_assert(frame_meta); // must not be empty
-    uint64_t pts = frame_meta->pts;
-    state->frame_meta_queue = frame_meta->next; // remove the item
-    frame_meta_delete(frame_meta);
-    return pts;
-}
-
-static int
-read_packet_with_meta(void *opaque, uint8_t *buf, int buf_size) {
-    struct stream *stream = opaque;
+stream_recv_packet(struct stream *stream, void **out_data, size_t *out_size) {
     struct receiver_state *state = &stream->receiver_state;
 
     // The video stream contains raw packets, without time information. When we
@@ -82,60 +38,33 @@ read_packet_with_meta(void *opaque, uint8_t *buf, int buf_size) {
     //
     // It is followed by <packet_size> bytes containing the packet/frame.
 
-    if (!state->remaining) {
-#define HEADER_SIZE 12
-        uint8_t header[HEADER_SIZE];
-        ssize_t r = net_recv_all(stream->socket, header, HEADER_SIZE);
-        if (r == -1) {
-            return AVERROR(errno);
-        }
-        if (r == 0) {
-            return AVERROR_EOF;
-        }
-        // no partial read (net_recv_all())
-        SDL_assert_release(r == HEADER_SIZE);
-
-        uint64_t pts = buffer_read64be(header);
-        state->remaining = buffer_read32be(&header[8]);
-
-        if (pts != NO_PTS && !receiver_state_push_meta(state, pts)) {
-            LOGE("Could not store PTS for recording");
-            // we could not save the PTS, the recording would be broken
-            return AVERROR(ENOMEM);
-        }
+    uint8_t header[HEADER_SIZE];
+    ssize_t r = net_recv_all(stream->socket, header, HEADER_SIZE);
+    if (r < HEADER_SIZE) {
+        return false;
     }
 
-    SDL_assert(state->remaining);
+    state->pts = buffer_read64be(header);
+    uint32_t len = buffer_read32be(&header[8]);
+    SDL_assert(len);
 
-    if (buf_size > state->remaining) {
-        buf_size = state->remaining;
+    //LOGD("len = %d", (int) len);
+
+    void *buf = av_malloc(len);
+    if (!buf) {
+        LOGE("Could not allocate packet buffer");
+        return false;
     }
 
-    ssize_t r = net_recv(stream->socket, buf, buf_size);
-    if (r == -1) {
-        return errno ? AVERROR(errno) : AVERROR_EOF;
-    }
-    if (r == 0) {
-        return AVERROR_EOF;
+    *out_data = buf;
+    *out_size = len;
+
+    r = net_recv_all(stream->socket, buf, len);
+    if (r < len) {
+        return false;
     }
 
-    SDL_assert(state->remaining >= r);
-    state->remaining -= r;
-
-    return r;
-}
-
-static int
-read_raw_packet(void *opaque, uint8_t *buf, int buf_size) {
-    struct stream *stream = opaque;
-    ssize_t r = net_recv(stream->socket, buf, buf_size);
-    if (r == -1) {
-        return errno ? AVERROR(errno) : AVERROR_EOF;
-    }
-    if (r == 0) {
-        return AVERROR_EOF;
-    }
-    return r;
+    return true;
 }
 
 static void
@@ -145,45 +74,72 @@ notify_stopped(void) {
     SDL_PushEvent(&stop_event);
 }
 
+static bool
+process_packet(struct stream *stream, AVPacket *packet) {
+    uint64_t pts = stream->receiver_state.pts;
+    if (stream->decoder && !decoder_push(stream->decoder, packet)) {
+        return false;
+    }
+
+    if (stream->recorder) {
+        packet->pts = pts;
+        packet->dts = pts;
+        LOGD("recording with pts = %d", (int) packet->pts);
+
+        if (!recorder_write(stream->recorder, packet)) {
+            LOGE("Could not write frame to output file");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool
+stream_parse(struct stream *stream, void *data, size_t len) {
+    SDL_assert(stream->receiver_state.pts != NO_PTS);
+
+    uint8_t *in_data = data;
+    int in_len = len;
+    uint8_t *out_data = NULL;
+    int out_len = 0;
+    if (stream->receiver_state.pts != NO_PTS) {
+        while (in_len) {
+            int r = av_parser_parse2(stream->parser, stream->codec_ctx,
+                                     &out_data, &out_len, in_data, in_len,
+                                     AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+            //LOGD("av_parser_parse2 %d returned %d", (int) len, r);
+            in_data += r;
+            in_len -= r;
+            //LOGD("r = %d, out_len = %d", (int) r, (int) out_len);
+            if (out_len) {
+                //LOGD("pts = %d", (int) stream->receiver_state.pts);
+                AVPacket packet;
+                av_init_packet(&packet);
+                packet.data = out_data;
+                packet.size = out_len;
+
+                if (stream->parser->key_frame == 1) {
+                    packet.flags |= AV_PKT_FLAG_KEY;
+                }
+
+                bool ok = process_packet(stream, &packet);
+                av_packet_unref(&packet);
+
+                if (!ok) {
+                    LOGE("Could not process packet");
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 static int
 run_stream(void *data) {
     struct stream *stream = data;
-
-    AVFormatContext *format_ctx = avformat_alloc_context();
-    if (!format_ctx) {
-        LOGC("Could not allocate format context");
-        goto end;
-    }
-
-    unsigned char *buffer = av_malloc(BUFSIZE);
-    if (!buffer) {
-        LOGC("Could not allocate buffer");
-        goto finally_free_format_ctx;
-    }
-
-    // initialize the receiver state
-    stream->receiver_state.frame_meta_queue = NULL;
-    stream->receiver_state.remaining = 0;
-
-    // if recording is enabled, a "header" is sent between raw packets
-    int (*read_packet)(void *, uint8_t *, int) =
-            stream->recorder ? read_packet_with_meta : read_raw_packet;
-    AVIOContext *avio_ctx = avio_alloc_context(buffer, BUFSIZE, 0, stream,
-                                               read_packet, NULL, NULL);
-    if (!avio_ctx) {
-        LOGC("Could not allocate avio context");
-        // avformat_open_input takes ownership of 'buffer'
-        // so only free the buffer before avformat_open_input()
-        av_free(buffer);
-        goto finally_free_format_ctx;
-    }
-
-    format_ctx->pb = avio_ctx;
-
-    if (avformat_open_input(&format_ctx, NULL, NULL, NULL) < 0) {
-        LOGE("Could not open video stream");
-        goto finally_free_avio_ctx;
-    }
 
     AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) {
@@ -191,9 +147,15 @@ run_stream(void *data) {
         goto end;
     }
 
+    stream->codec_ctx = avcodec_alloc_context3(codec);
+    if (!stream->codec_ctx) {
+        LOGC("Could not allocate codec context");
+        goto end;
+    }
+
     if (stream->decoder && !decoder_open(stream->decoder, codec)) {
         LOGE("Could not open decoder");
-        goto finally_close_input;
+        goto finally_free_codec_ctx;
     }
 
     if (stream->recorder && !recorder_open(stream->recorder, codec)) {
@@ -201,50 +163,32 @@ run_stream(void *data) {
         goto finally_close_decoder;
     }
 
-    AVPacket packet;
-    av_init_packet(&packet);
-    packet.data = NULL;
-    packet.size = 0;
+    stream->parser = av_parser_init(AV_CODEC_ID_H264);
+    // We must only pass complete frames to av_parser_parse2()!
+    // This allow to reduce the latency by 1 frame
+    stream->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
 
-    while (!av_read_frame(format_ctx, &packet)) {
-        if (SDL_AtomicGet(&stream->stopped)) {
-            // if the stream is stopped, the socket had been shutdown, so the
-            // last packet is probably corrupted (but not detected as such by
-            // FFmpeg) and will not be decoded correctly
-            av_packet_unref(&packet);
-            goto quit;
-        }
-        if (stream->decoder && !decoder_push(stream->decoder, &packet)) {
-            av_packet_unref(&packet);
-            goto quit;
-        }
-
-        if (stream->recorder) {
-            // we retrieve the PTS in order they were received, so they will
-            // be assigned to the correct frame
-            uint64_t pts = receiver_state_take_meta(&stream->receiver_state);
-            packet.pts = pts;
-            packet.dts = pts;
-
-            // no need to rescale with av_packet_rescale_ts(), the timestamps
-            // are in microseconds both in input and output
-            if (!recorder_write(stream->recorder, &packet)) {
-                LOGE("Could not write frame to output file");
-                av_packet_unref(&packet);
-                goto quit;
-            }
-        }
-
-        av_packet_unref(&packet);
-
-        if (avio_ctx->eof_reached) {
+    for (;;) {
+        void *data;
+        size_t len;
+        bool ok = stream_recv_packet(stream, &data, &len);
+        if (!ok) {
+            // end of stream
             break;
         }
+
+        ok = stream_parse(stream, data, len);
+        if (!ok) {
+            // cannot process packet (error already logged)
+            break;
+        }
+
+        av_free(data);
     }
 
     LOGD("End of frames");
 
-quit:
+finally_close_recorder:
     if (stream->recorder) {
         recorder_close(stream->recorder);
     }
@@ -252,13 +196,8 @@ finally_close_decoder:
     if (stream->decoder) {
         decoder_close(stream->decoder);
     }
-finally_close_input:
-    avformat_close_input(&format_ctx);
-finally_free_avio_ctx:
-    av_free(avio_ctx->buffer);
-    av_free(avio_ctx);
-finally_free_format_ctx:
-    avformat_free_context(format_ctx);
+finally_free_codec_ctx:
+    avcodec_free_context(&stream->codec_ctx);
 end:
     notify_stopped();
     return 0;
@@ -270,7 +209,7 @@ stream_init(struct stream *stream, socket_t socket,
     stream->socket = socket;
     stream->decoder = decoder,
     stream->recorder = recorder;
-    SDL_AtomicSet(&stream->stopped, 0);
+    stream->receiver_state.pts = NO_PTS;
 }
 
 bool
@@ -287,7 +226,6 @@ stream_start(struct stream *stream) {
 
 void
 stream_stop(struct stream *stream) {
-    SDL_AtomicSet(&stream->stopped, 1);
     if (stream->decoder) {
         decoder_interrupt(stream->decoder);
     }
