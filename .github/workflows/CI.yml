@@ -11,8 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
-    - name: Workaround for checkstyle failures
-      run: sed -i 's/server check/server/g' release.sh
     - name: Allow builder user to write to project directory
       run: chmod -R 777 .
     - name: Run scrcpy buid using docker-compose
